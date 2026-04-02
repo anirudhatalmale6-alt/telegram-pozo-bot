@@ -153,7 +153,7 @@ async def resend_board(bot, pozo, reply_markup=None, disable_notification=True):
 
 # ─── Pozo update loop ────────────────────────────────────────────────────────
 async def pozo_update_loop(app: Application):
-    """Delete and resend the pozo board every 5 seconds so it stays at bottom."""
+    """Edit board in place every 5 seconds (no new messages)."""
     global data
 
     while True:
@@ -167,8 +167,7 @@ async def pozo_update_loop(app: Application):
             remaining = pozo["end_time"] - time.time()
 
             if remaining <= 0:
-                # Pozo ended - send final board without buttons
-                text = render_board(pozo)
+                # Pozo ended - delete board and send final result
                 old_msg_id = pozo.get("message_id")
                 if old_msg_id:
                     try:
@@ -178,6 +177,7 @@ async def pozo_update_loop(app: Application):
                     except (BadRequest, TelegramError):
                         pass
 
+                text = render_board(pozo)
                 await app.bot.send_message(
                     chat_id=pozo["chat_id"],
                     text=text
@@ -223,11 +223,20 @@ async def pozo_update_loop(app: Application):
                 save_data(data)
                 break
 
-            # Resend board at bottom (silent - no notification sound)
-            async with pozo_lock:
-                await resend_board(app.bot, pozo, BOARD_INLINE, disable_notification=True)
-                data["pozo"] = pozo
-                save_data(data)
+            # Edit board in place (no new message, just updates the text)
+            text = render_board(pozo)
+            try:
+                await app.bot.edit_message_text(
+                    chat_id=pozo["chat_id"],
+                    message_id=pozo["message_id"],
+                    text=text,
+                    reply_markup=BOARD_INLINE
+                )
+            except BadRequest as e:
+                if "not modified" not in str(e).lower():
+                    logger.warning(f"Edit failed: {e}")
+            except TelegramError as e:
+                logger.warning(f"Telegram error in loop: {e}")
 
         except asyncio.CancelledError:
             break
@@ -387,7 +396,7 @@ async def do_bid(user, chat_id, context, is_callback=False, query=None):
         data["pozo"] = pozo
         save_data(data)
 
-    # Send notification to group FIRST (with sound for push notification)
+    # Send notification to group (with sound for push notification)
     username = f"@{user.username}" if user.username else user.full_name
     await context.bot.send_message(
         chat_id=pozo["chat_id"],
@@ -395,7 +404,7 @@ async def do_bid(user, chat_id, context, is_callback=False, query=None):
         reply_markup=MAIN_KEYBOARD
     )
 
-    # Then resend board at bottom (silent) so it's always visible
+    # Resend board at bottom (silent) so it's visible after the notification
     await resend_board(context.bot, pozo, BOARD_INLINE, disable_notification=True)
     data["pozo"] = pozo
     save_data(data)
