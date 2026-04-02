@@ -356,6 +356,96 @@ async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+async def cmd_cerrarpozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner command to close the current pozo immediately."""
+    global data, pozo_task
+
+    if update.effective_user.id != OWNER_ID:
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
+        return
+
+    if data["pozo"] is None:
+        await update.message.reply_text("❌ No hay pozo activo.")
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
+        return
+
+    pozo = data["pozo"]
+
+    # Cancel update loop
+    if pozo_task and not pozo_task.done():
+        pozo_task.cancel()
+        try:
+            await pozo_task
+        except asyncio.CancelledError:
+            pass
+
+    # Delete board message
+    old_msg_id = pozo.get("message_id")
+    if old_msg_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=pozo["chat_id"], message_id=old_msg_id
+            )
+        except (BadRequest, TelegramError):
+            pass
+
+    # Announce closure
+    titular_user = pozo.get("titular_username", "")
+    titular_name = pozo.get("titular_name", "Nadie")
+    titular_id = pozo.get("titular_id")
+    prize = pozo["fund"] * PRIZE_PERCENT
+    winner = f"@{titular_user}" if titular_user else titular_name
+
+    if pozo["fund"] > 0 and titular_id:
+        await context.bot.send_message(
+            chat_id=pozo["chat_id"],
+            text=(
+                f"🔒 POZO CERRADO POR LA DUEÑA 🔒\n\n"
+                f"👑 Último titular: {winner}\n"
+                f"💰 Fondo: ${pozo['fund']:.2f}\n"
+                f"🎁 Premio (50%): ${prize:.2f}\n"
+                f"⚡ Pujas: {pozo['bid_count']}"
+            ),
+            reply_markup=MAIN_KEYBOARD
+        )
+        # Notify winner privately
+        try:
+            await context.bot.send_message(
+                chat_id=int(titular_id),
+                text=(
+                    f"🎉🎉🎉 ¡FELICIDADES! 🎉🎉🎉\n\n"
+                    f"¡Eres el GANADOR del pozo!\n"
+                    f"🎁 Tu premio: ${prize:.2f}\n\n"
+                    f"📋 Envía tus datos para recibir el pago:\n"
+                    f"- Nombre completo\n"
+                    f"- Número de teléfono / Binance ID\n"
+                    f"- Banco"
+                )
+            )
+        except TelegramError:
+            pass
+    else:
+        await context.bot.send_message(
+            chat_id=pozo["chat_id"],
+            text="🔒 POZO CERRADO POR LA DUEÑA 🔒\n\nNo hubo ganador.",
+            reply_markup=MAIN_KEYBOARD
+        )
+
+    data["pozo"] = None
+    save_data(data)
+
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+
+
 # ─── Bid logic (shared by keyboard button and inline button) ─────────────────
 async def do_bid(user, chat_id, context, is_callback=False, query=None):
     """Process a bid. Returns True if successful."""
@@ -671,6 +761,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("nuevopozo", cmd_nuevopozo))
     app.add_handler(CommandHandler("saldo", cmd_saldo))
+    app.add_handler(CommandHandler("cerrarpozo", cmd_cerrarpozo))
 
     # Keyboard button handlers (persistent keyboard at bottom)
     app.add_handler(MessageHandler(
