@@ -125,9 +125,35 @@ def render_board(pozo):
     )
 
 
+# ─── Helper: resend board at bottom ──────────────────────────────────────────
+async def resend_board(bot, pozo, reply_markup=None, disable_notification=True):
+    """Delete old board message and send a new one so it stays at the bottom."""
+    chat_id = pozo["chat_id"]
+    old_msg_id = pozo.get("message_id")
+
+    # Delete old board message
+    if old_msg_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
+        except (BadRequest, TelegramError):
+            pass
+
+    # Send new board at bottom
+    text = render_board(pozo)
+    markup = reply_markup if reply_markup else BOARD_INLINE
+    msg = await bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=markup,
+        disable_notification=disable_notification
+    )
+    pozo["message_id"] = msg.message_id
+    return msg
+
+
 # ─── Pozo update loop ────────────────────────────────────────────────────────
 async def pozo_update_loop(app: Application):
-    """Update the pozo board every 5 seconds."""
+    """Delete and resend the pozo board every 5 seconds so it stays at bottom."""
     global data
 
     while True:
@@ -141,17 +167,21 @@ async def pozo_update_loop(app: Application):
             remaining = pozo["end_time"] - time.time()
 
             if remaining <= 0:
-                # Pozo ended - update board (remove inline buttons)
+                # Pozo ended - send final board without buttons
                 text = render_board(pozo)
-                try:
-                    await app.bot.edit_message_text(
-                        chat_id=pozo["chat_id"],
-                        message_id=pozo["message_id"],
-                        text=text,
-                        reply_markup=None
-                    )
-                except (BadRequest, TelegramError):
-                    pass
+                old_msg_id = pozo.get("message_id")
+                if old_msg_id:
+                    try:
+                        await app.bot.delete_message(
+                            chat_id=pozo["chat_id"], message_id=old_msg_id
+                        )
+                    except (BadRequest, TelegramError):
+                        pass
+
+                await app.bot.send_message(
+                    chat_id=pozo["chat_id"],
+                    text=text
+                )
 
                 # Announce winner in group
                 titular_user = pozo.get("titular_username", "")
@@ -171,7 +201,7 @@ async def pozo_update_loop(app: Application):
                     reply_markup=MAIN_KEYBOARD
                 )
 
-                # Send private message to winner asking for payment data
+                # Send private message to winner
                 if titular_id:
                     try:
                         await app.bot.send_message(
@@ -193,20 +223,11 @@ async def pozo_update_loop(app: Application):
                 save_data(data)
                 break
 
-            # Update board with inline buttons
-            text = render_board(pozo)
-            try:
-                await app.bot.edit_message_text(
-                    chat_id=pozo["chat_id"],
-                    message_id=pozo["message_id"],
-                    text=text,
-                    reply_markup=BOARD_INLINE
-                )
-            except BadRequest as e:
-                if "not modified" not in str(e).lower():
-                    logger.warning(f"Edit failed: {e}")
-            except TelegramError as e:
-                logger.warning(f"Telegram error in loop: {e}")
+            # Resend board at bottom (silent - no notification sound)
+            async with pozo_lock:
+                await resend_board(app.bot, pozo, BOARD_INLINE, disable_notification=True)
+                data["pozo"] = pozo
+                save_data(data)
 
         except asyncio.CancelledError:
             break
@@ -366,25 +387,18 @@ async def do_bid(user, chat_id, context, is_callback=False, query=None):
         data["pozo"] = pozo
         save_data(data)
 
-    # Update board immediately
-    text = render_board(pozo)
-    try:
-        await context.bot.edit_message_text(
-            chat_id=pozo["chat_id"],
-            message_id=pozo["message_id"],
-            text=text,
-            reply_markup=BOARD_INLINE
-        )
-    except (BadRequest, TelegramError):
-        pass
-
-    # Send notification to group (NEW message = push notification for everyone)
+    # Send notification to group FIRST (with sound for push notification)
     username = f"@{user.username}" if user.username else user.full_name
     await context.bot.send_message(
         chat_id=pozo["chat_id"],
         text=f"⚡ ¡NUEVO LÍDER! {username} tomó el mando y restó 1 minuto. ⏱️",
         reply_markup=MAIN_KEYBOARD
     )
+
+    # Then resend board at bottom (silent) so it's always visible
+    await resend_board(context.bot, pozo, BOARD_INLINE, disable_notification=True)
+    data["pozo"] = pozo
+    save_data(data)
 
     return True, "⚡ ¡Tomaste la posición!"
 
