@@ -1,0 +1,5 @@
+venv/
+data.json
+__pycache__/
+*.pyc
+bot_test.log
