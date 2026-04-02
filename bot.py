@@ -8,10 +8,10 @@ import logging
 import time
 import json
 import os
-from datetime import datetime
 
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -39,6 +39,16 @@ PAYMENT_INFO = """💰 DATOS DE PAGO 💰
 
 Envía el capture de tu pago aquí y será verificado."""
 
+# Persistent keyboard buttons
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("⚡ TOMAR POSICIÓN")],
+        [KeyboardButton("💰 GESTIONAR ACTIVO"), KeyboardButton("💳 MI SALDO")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -61,7 +71,6 @@ def save_data(data):
 
 # Global state
 data = load_data()
-# Active pozo update task
 pozo_task = None
 pozo_lock = asyncio.Lock()
 
@@ -72,23 +81,30 @@ def render_board(pozo):
     minutes = int(remaining) // 60
     seconds = int(remaining) % 60
 
-    titular = pozo.get("titular_name", "Nadie")
     titular_user = pozo.get("titular_username", "")
-    if titular_user:
-        titular_display = f"@{titular_user}"
-    else:
-        titular_display = titular
+    titular_name = pozo.get("titular_name", "Nadie")
+    titular_display = f"@{titular_user}" if titular_user else titular_name
 
     fund = pozo["fund"]
     prize = fund * PRIZE_PERCENT
     bids = pozo.get("bid_count", 0)
 
     # Animated indicator
-    dots = ["⏳", "⌛"]
-    tick = int(time.time()) % 2
-    anim = dots[tick]
+    anim = "⏳" if int(time.time()) % 2 == 0 else "⌛"
 
-    text = (
+    if remaining <= 0:
+        return (
+            f"{'='*28}\n"
+            f"    🏆 POZO FINALIZADO 🏆\n"
+            f"{'='*28}\n\n"
+            f"🎉 GANADOR: {titular_display}\n\n"
+            f"💰 Fondo total: ${fund:.2f}\n"
+            f"🎁 Premio: ${prize:.2f}\n"
+            f"⚡ Pujas totales: {bids}\n\n"
+            f"{'='*28}"
+        )
+
+    return (
         f"{'='*28}\n"
         f"    🏆 POZO ACTIVO 🏆\n"
         f"{'='*28}\n\n"
@@ -100,37 +116,11 @@ def render_board(pozo):
         f"{'='*28}"
     )
 
-    if remaining <= 0:
-        text = (
-            f"{'='*28}\n"
-            f"    🏆 POZO FINALIZADO 🏆\n"
-            f"{'='*28}\n\n"
-            f"🎉 GANADOR: {titular_display}\n\n"
-            f"💰 Fondo total: ${fund:.2f}\n"
-            f"🎁 Premio: ${prize:.2f}\n"
-            f"⚡ Pujas totales: {bids}\n\n"
-            f"{'='*28}"
-        )
-
-    return text
-
-
-def get_board_keyboard(active=True):
-    if active:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("⚡ TOMAR POSICIÓN ($0.25)", callback_data="bid")],
-            [
-                InlineKeyboardButton("💰 GESTIONAR ACTIVO", callback_data="payment_info"),
-                InlineKeyboardButton("💳 MI SALDO", callback_data="my_balance"),
-            ]
-        ])
-    return None
-
 
 # ─── Pozo update loop ────────────────────────────────────────────────────────
 async def pozo_update_loop(app: Application):
     """Update the pozo board every 5 seconds."""
-    global data, pozo_task
+    global data
 
     while True:
         try:
@@ -143,27 +133,23 @@ async def pozo_update_loop(app: Application):
             remaining = pozo["end_time"] - time.time()
 
             if remaining <= 0:
-                # Pozo ended
+                # Pozo ended - update board
                 text = render_board(pozo)
                 try:
                     await app.bot.edit_message_text(
                         chat_id=pozo["chat_id"],
                         message_id=pozo["message_id"],
-                        text=text,
-                        reply_markup=None
+                        text=text
                     )
                 except (BadRequest, TelegramError):
                     pass
 
-                # Announce winner
-                titular = pozo.get("titular_username", "")
+                # Announce winner in group
+                titular_user = pozo.get("titular_username", "")
                 titular_name = pozo.get("titular_name", "Nadie")
+                titular_id = pozo.get("titular_id")
                 prize = pozo["fund"] * PRIZE_PERCENT
-
-                if titular:
-                    winner = f"@{titular}"
-                else:
-                    winner = titular_name
+                winner = f"@{titular_user}" if titular_user else titular_name
 
                 await app.bot.send_message(
                     chat_id=pozo["chat_id"],
@@ -175,22 +161,37 @@ async def pozo_update_loop(app: Application):
                     )
                 )
 
+                # Send private message to winner
+                if titular_id:
+                    try:
+                        await app.bot.send_message(
+                            chat_id=int(titular_id),
+                            text=(
+                                f"🎉🎉🎉 ¡FELICIDADES! 🎉🎉🎉\n\n"
+                                f"¡Eres el GANADOR del pozo!\n"
+                                f"🎁 Tu premio: ${prize:.2f}\n\n"
+                                f"📋 Envía tus datos para recibir el pago:\n"
+                                f"- Nombre completo\n"
+                                f"- Número de teléfono / Binance ID\n"
+                                f"- Banco"
+                            )
+                        )
+                    except TelegramError:
+                        pass
+
                 data["pozo"] = None
                 save_data(data)
                 break
 
             # Update board
             text = render_board(pozo)
-            keyboard = get_board_keyboard(True)
             try:
                 await app.bot.edit_message_text(
                     chat_id=pozo["chat_id"],
                     message_id=pozo["message_id"],
-                    text=text,
-                    reply_markup=keyboard
+                    text=text
                 )
             except BadRequest as e:
-                # "Message is not modified" is expected if nothing changed
                 if "not modified" not in str(e).lower():
                     logger.warning(f"Edit failed: {e}")
             except TelegramError as e:
@@ -205,15 +206,24 @@ async def pozo_update_loop(app: Application):
 
 # ─── Command handlers ────────────────────────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🎰 Bienvenido al Bot de Pozos\n\n"
-        "Usa los botones del tablero para participar.\n"
-        "Envía un capture de pago para recargar saldo."
-    )
-    try:
-        await update.message.delete()
-    except TelegramError:
-        pass
+    chat = update.effective_chat
+
+    if chat.type == "private":
+        await update.message.reply_text(
+            "🎰 Bienvenido al Bot de Pozos\n\n"
+            "📸 Envía aquí tu capture de pago para recargar saldo.\n"
+            "Usa los botones de abajo para participar.",
+            reply_markup=MAIN_KEYBOARD
+        )
+    else:
+        await update.message.reply_text(
+            "💎 SISTEMA @isreloj_liah ON",
+            reply_markup=MAIN_KEYBOARD
+        )
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
 
 
 async def cmd_nuevopozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -248,10 +258,15 @@ async def cmd_nuevopozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "message_id": None,
     }
 
-    text = render_board(pozo)
-    keyboard = get_board_keyboard(True)
+    # Send the keyboard first
+    await update.effective_chat.send_message(
+        text="⏳ INICIANDO RELOJ...",
+        reply_markup=MAIN_KEYBOARD
+    )
 
-    msg = await update.effective_chat.send_message(text=text, reply_markup=keyboard)
+    # Send the board (no inline buttons - we use the persistent keyboard)
+    text = render_board(pozo)
+    msg = await update.effective_chat.send_message(text=text)
     pozo["message_id"] = msg.message_id
 
     data["pozo"] = pozo
@@ -267,7 +282,7 @@ async def cmd_nuevopozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Owner command to check/set user balances: /saldo @user or /saldo @user 5.00"""
+    """Owner command: /saldo todos"""
     if update.effective_user.id != OWNER_ID:
         try:
             await update.message.delete()
@@ -277,10 +292,9 @@ async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     args = context.args
     if not args:
-        await update.message.reply_text("Uso: /saldo <user_id> [monto]")
+        await update.message.reply_text("Uso: /saldo todos")
         return
 
-    # For now just show all balances
     if args[0] == "todos":
         if not data["balances"]:
             await update.message.reply_text("No hay saldos registrados.")
@@ -297,38 +311,63 @@ async def cmd_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-# ─── Callback handlers ───────────────────────────────────────────────────────
-async def handle_bid(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the TOMAR POSICIÓN button."""
+# ─── Keyboard button handlers (text-based) ──────────────────────────────────
+async def handle_tomar_posicion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the TOMAR POSICIÓN keyboard button."""
     global data
-    query = update.callback_query
+    user = update.effective_user
+    chat = update.effective_chat
+
+    # Delete the button text message to keep chat clean
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
 
     if data["pozo"] is None:
-        await query.answer("❌ No hay pozo activo.", show_alert=True)
+        try:
+            msg = await chat.send_message("❌ No hay pozo activo.")
+            await asyncio.sleep(3)
+            await msg.delete()
+        except TelegramError:
+            pass
         return
 
     pozo = data["pozo"]
     remaining = pozo["end_time"] - time.time()
     if remaining <= 0:
-        await query.answer("❌ El pozo ya finalizó.", show_alert=True)
+        try:
+            msg = await chat.send_message("❌ El pozo ya finalizó.")
+            await asyncio.sleep(3)
+            await msg.delete()
+        except TelegramError:
+            pass
         return
 
-    user = query.from_user
     user_id = str(user.id)
 
     # Check if user is already the titular
     if pozo["titular_id"] == user_id:
-        await query.answer("⚠️ Ya eres el titular actual.", show_alert=True)
+        try:
+            msg = await chat.send_message("⚠️ Ya eres el titular actual.")
+            await asyncio.sleep(3)
+            await msg.delete()
+        except TelegramError:
+            pass
         return
 
     # Check balance
     user_data = data["balances"].get(user_id, {"balance": 0, "name": user.full_name})
     if user_data["balance"] < BID_COST:
-        await query.answer(
-            f"❌ Saldo insuficiente. Tienes ${user_data['balance']:.2f}, necesitas ${BID_COST:.2f}.\n"
-            f"Usa 💰 GESTIONAR ACTIVO para recargar.",
-            show_alert=True
-        )
+        try:
+            msg = await chat.send_message(
+                f"❌ Saldo insuficiente. Tienes ${user_data['balance']:.2f}, necesitas ${BID_COST:.2f}.\n"
+                f"Usa 💰 GESTIONAR ACTIVO para recargar."
+            )
+            await asyncio.sleep(5)
+            await msg.delete()
+        except TelegramError:
+            pass
         return
 
     async with pozo_lock:
@@ -350,17 +389,13 @@ async def handle_bid(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data["pozo"] = pozo
         save_data(data)
 
-    await query.answer("⚡ ¡Tomaste la posición!")
-
     # Update board immediately
     text = render_board(pozo)
-    keyboard = get_board_keyboard(True)
     try:
         await context.bot.edit_message_text(
             chat_id=pozo["chat_id"],
             message_id=pozo["message_id"],
-            text=text,
-            reply_markup=keyboard
+            text=text
         )
     except (BadRequest, TelegramError):
         pass
@@ -373,54 +408,62 @@ async def handle_bid(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-async def handle_payment_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send payment info privately."""
-    query = update.callback_query
+async def handle_gestionar_activo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle GESTIONAR ACTIVO keyboard button."""
+    # Delete the button text message
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+
     try:
         await context.bot.send_message(
-            chat_id=query.from_user.id,
+            chat_id=update.effective_user.id,
             text=PAYMENT_INFO
         )
-        await query.answer("📩 Te envié los datos de pago por privado.")
     except TelegramError:
-        await query.answer(
-            "❌ No pude enviarte mensaje privado. "
-            "Primero escríbele /start al bot por privado.",
-            show_alert=True
-        )
+        try:
+            msg = await update.effective_chat.send_message(
+                "❌ No pude enviarte mensaje privado. Primero escríbele /start al bot por privado."
+            )
+            await asyncio.sleep(5)
+            await msg.delete()
+        except TelegramError:
+            pass
 
 
-async def handle_my_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show user balance privately."""
-    query = update.callback_query
-    user_id = str(query.from_user.id)
+async def handle_mi_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle MI SALDO keyboard button."""
+    # Delete the button text message
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+
+    user_id = str(update.effective_user.id)
     balance = data["balances"].get(user_id, {}).get("balance", 0)
 
     try:
         await context.bot.send_message(
-            chat_id=query.from_user.id,
+            chat_id=update.effective_user.id,
             text=f"💳 Tu saldo: ${balance:.2f}"
         )
-        await query.answer("📩 Te envié tu saldo por privado.")
     except TelegramError:
-        await query.answer(
-            f"💳 Tu saldo: ${balance:.2f}",
-            show_alert=True
-        )
+        try:
+            msg = await update.effective_chat.send_message(f"💳 Tu saldo: ${balance:.2f}")
+            await asyncio.sleep(5)
+            await msg.delete()
+        except TelegramError:
+            pass
 
 
+# ─── Callback handlers (for approve/reject inline buttons) ───────────────────
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Route callback queries."""
     query = update.callback_query
     cb_data = query.data
 
-    if cb_data == "bid":
-        await handle_bid(update, context)
-    elif cb_data == "payment_info":
-        await handle_payment_info(update, context)
-    elif cb_data == "my_balance":
-        await handle_my_balance(update, context)
-    elif cb_data.startswith("approve_"):
+    if cb_data.startswith("approve_"):
         await handle_approve(update, context)
     elif cb_data.startswith("reject_"):
         await handle_reject(update, context)
@@ -433,11 +476,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
 
-    # Only process photos in group chats
-    if chat.type not in ("group", "supergroup"):
-        return
-
-    photo = update.message.photo[-1]  # Best quality
+    photo = update.message.photo[-1]
     user_id = str(user.id)
     username = f"@{user.username}" if user.username else user.full_name
 
@@ -467,10 +506,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Could not forward payment to owner: {e}")
 
     # Delete the photo from group to keep chat clean
-    try:
-        await update.message.delete()
-    except TelegramError:
-        pass
+    if chat.type in ("group", "supergroup"):
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
 
     # Notify user
     try:
@@ -532,7 +572,6 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=f"❌ RECHAZADO - {user_name} (ID: {user_id})"
     )
 
-    # Notify user
     try:
         await context.bot.send_message(
             chat_id=int(user_id),
@@ -544,7 +583,7 @@ async def handle_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Moderation ───────────────────────────────────────────────────────────────
 async def handle_text_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Delete non-command text messages in group to keep chat clean."""
+    """Delete non-command, non-button text messages in group to keep chat clean."""
     if update.effective_chat.type not in ("group", "supergroup"):
         return
 
@@ -585,13 +624,24 @@ def main():
     app.add_handler(CommandHandler("nuevopozo", cmd_nuevopozo))
     app.add_handler(CommandHandler("saldo", cmd_saldo))
 
-    # Callback queries (buttons)
+    # Keyboard button handlers (match exact text)
+    app.add_handler(MessageHandler(
+        filters.Regex("^⚡ TOMAR POSICIÓN$"), handle_tomar_posicion
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex("^💰 GESTIONAR ACTIVO$"), handle_gestionar_activo
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex("^💳 MI SALDO$"), handle_mi_saldo
+    ))
+
+    # Callback queries (approve/reject inline buttons)
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Photos (payment captures)
-    app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.GROUPS, handle_photo))
+    # Photos (payment captures) - works in groups AND private
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
-    # Text moderation (delete non-command text in groups)
+    # Text moderation (delete any other text in groups)
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
         handle_text_moderation
