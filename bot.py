@@ -87,6 +87,8 @@ def save_data(data):
 data = load_data()
 pozo_task = None
 pozo_lock = asyncio.Lock()
+cooldowns = {}  # {user_id: last_bid_timestamp}
+COOLDOWN_SECONDS = 5
 
 
 # ─── Board rendering ─────────────────────────────────────────────────────────
@@ -462,6 +464,14 @@ async def do_bid(user, chat_id, context, is_callback=False, query=None):
         return False, "❌ El pozo ya finalizó."
 
     user_id = str(user.id)
+    username = f"@{user.username}" if user.username else user.full_name
+
+    # Cooldown check
+    last_bid = cooldowns.get(user_id, 0)
+    elapsed = time.time() - last_bid
+    if elapsed < COOLDOWN_SECONDS:
+        remaining_cd = int(COOLDOWN_SECONDS - elapsed) + 1
+        return False, f"⚠️ {username}, debes esperar {remaining_cd} segundos para volver a tomar la posición."
 
     if pozo["titular_id"] == user_id:
         return False, "⚠️ Ya eres el titular actual."
@@ -487,6 +497,9 @@ async def do_bid(user, chat_id, context, is_callback=False, query=None):
 
         data["pozo"] = pozo
         save_data(data)
+
+    # Set cooldown for this user
+    cooldowns[user_id] = time.time()
 
     # Delete previous notification to keep chat clean
     old_notif = pozo.get("notification_msg_id")
