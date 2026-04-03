@@ -39,23 +39,28 @@ PAYMENT_INFO = """💰 DATOS DE PAGO 💰
 
 Envía el capture de tu pago aquí y será verificado."""
 
-# Persistent keyboard buttons (always visible at bottom)
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
+# Group keyboard - only TOMAR POSICIÓN
+GROUP_KEYBOARD = ReplyKeyboardMarkup(
     [
         [KeyboardButton("⚡ TOMAR POSICIÓN")],
-        [KeyboardButton("💰 GESTIONAR ACTIVO"), KeyboardButton("💳 MI SALDO")],
     ],
     resize_keyboard=True,
     is_persistent=True,
 )
 
-# Inline buttons on the board message itself
+# Private keyboard - GESTIONAR ACTIVO and MI SALDO
+PRIVATE_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("💰 GESTIONAR ACTIVO")],
+        [KeyboardButton("💳 MI SALDO")],
+    ],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+
+# Inline button on the board message itself (only bid)
 BOARD_INLINE = InlineKeyboardMarkup([
     [InlineKeyboardButton("⚡ TOMAR POSICIÓN ($0.25)", callback_data="bid")],
-    [
-        InlineKeyboardButton("💰 GESTIONAR ACTIVO", callback_data="payment_info"),
-        InlineKeyboardButton("💳 MI SALDO", callback_data="my_balance"),
-    ]
 ])
 
 logging.basicConfig(
@@ -198,7 +203,7 @@ async def pozo_update_loop(app: Application):
                         f"🎁 Premio: ${prize:.2f}\n\n"
                         f"¡Felicidades!"
                     ),
-                    reply_markup=MAIN_KEYBOARD
+                    reply_markup=GROUP_KEYBOARD
                 )
 
                 # Send private message to winner
@@ -253,14 +258,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "🎰 Bienvenido al Bot de Pozos\n\n"
             "📸 Envía aquí tu capture de pago para recargar saldo.\n"
-            "Usa los botones de abajo para participar.",
-            reply_markup=MAIN_KEYBOARD
+            "Usa los botones de abajo para ver datos de pago o tu saldo.",
+            reply_markup=PRIVATE_KEYBOARD
         )
     else:
         # In group: send keyboard so THIS user sees the persistent buttons
         await update.message.reply_text(
-            "💎 SISTEMA ON\n\nUsa los botones de abajo para participar.",
-            reply_markup=MAIN_KEYBOARD
+            "💎 SISTEMA ON\n\nUsa el botón de abajo para participar.",
+            reply_markup=GROUP_KEYBOARD
         )
         try:
             await update.message.delete()
@@ -303,7 +308,7 @@ async def cmd_nuevopozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Send init message with persistent keyboard (so all users see buttons)
     await update.effective_chat.send_message(
         text="⏳ INICIANDO RELOJ...",
-        reply_markup=MAIN_KEYBOARD
+        reply_markup=GROUP_KEYBOARD
     )
 
     # Send the board WITH inline buttons on the message itself
@@ -412,7 +417,7 @@ async def cmd_cerrarpozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎁 Premio (50%): ${prize:.2f}\n"
                 f"⚡ Pujas: {pozo['bid_count']}"
             ),
-            reply_markup=MAIN_KEYBOARD
+            reply_markup=GROUP_KEYBOARD
         )
         # Notify winner privately
         try:
@@ -434,7 +439,7 @@ async def cmd_cerrarpozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=pozo["chat_id"],
             text="🔒 POZO CERRADO POR LA DUEÑA 🔒\n\nNo hubo ganador.",
-            reply_markup=MAIN_KEYBOARD
+            reply_markup=GROUP_KEYBOARD
         )
 
     data["pozo"] = None
@@ -491,7 +496,7 @@ async def do_bid(user, chat_id, context, is_callback=False, query=None):
     await context.bot.send_message(
         chat_id=pozo["chat_id"],
         text=f"⚡ ¡NUEVO LÍDER! {username} tomó el mando y restó 1 minuto. ⏱️",
-        reply_markup=MAIN_KEYBOARD
+        reply_markup=GROUP_KEYBOARD
     )
 
     # Resend board at bottom (silent) so it's visible after the notification
@@ -525,50 +530,61 @@ async def handle_tomar_posicion(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def handle_gestionar_activo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle GESTIONAR ACTIVO keyboard button."""
-    try:
-        await update.message.delete()
-    except TelegramError:
-        pass
+    """Handle GESTIONAR ACTIVO keyboard button - works in private chat."""
+    chat = update.effective_chat
 
-    try:
-        await context.bot.send_message(
-            chat_id=update.effective_user.id,
-            text=PAYMENT_INFO
-        )
-    except TelegramError:
+    if chat.type == "private":
+        # In private: reply directly
+        await update.message.reply_text(PAYMENT_INFO)
+    else:
+        # In group: delete message and send to private
         try:
-            msg = await update.effective_chat.send_message(
-                "❌ No pude enviarte mensaje privado. Primero escríbele /start al bot por privado."
-            )
-            await asyncio.sleep(5)
-            await msg.delete()
+            await update.message.delete()
         except TelegramError:
             pass
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=PAYMENT_INFO
+            )
+        except TelegramError:
+            try:
+                msg = await chat.send_message(
+                    "❌ No pude enviarte mensaje privado. Primero escríbele /start al bot por privado."
+                )
+                await asyncio.sleep(5)
+                await msg.delete()
+            except TelegramError:
+                pass
 
 
 async def handle_mi_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle MI SALDO keyboard button."""
-    try:
-        await update.message.delete()
-    except TelegramError:
-        pass
-
+    """Handle MI SALDO keyboard button - works in private chat."""
+    chat = update.effective_chat
     user_id = str(update.effective_user.id)
     balance = data["balances"].get(user_id, {}).get("balance", 0)
 
-    try:
-        await context.bot.send_message(
-            chat_id=update.effective_user.id,
-            text=f"💳 Tu saldo: ${balance:.2f}"
-        )
-    except TelegramError:
+    if chat.type == "private":
+        # In private: reply directly
+        await update.message.reply_text(f"💳 Tu saldo: ${balance:.2f}")
+    else:
+        # In group: delete message and send to private
         try:
-            msg = await update.effective_chat.send_message(f"💳 Tu saldo: ${balance:.2f}")
-            await asyncio.sleep(5)
-            await msg.delete()
+            await update.message.delete()
         except TelegramError:
             pass
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_user.id,
+                text=f"💳 Tu saldo: ${balance:.2f}"
+            )
+        except TelegramError:
+            try:
+                msg = await chat.send_message(f"💳 Tu saldo: ${balance:.2f}")
+                await asyncio.sleep(5)
+                await msg.delete()
+            except TelegramError:
+                pass
 
 
 # ─── Callback handlers (inline buttons on board + approve/reject) ────────────
