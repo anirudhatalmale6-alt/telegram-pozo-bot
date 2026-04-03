@@ -23,10 +23,17 @@ from telegram.error import TelegramError, BadRequest
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8799804918:AAEYl_DXbjtgAP6ubkTmDY6ix4RdRyTFkK0")
 OWNER_ID = int(os.environ.get("OWNER_ID", "6095017121"))
 BID_COST = 0.25
-INITIAL_TIME_SECONDS = 60 * 60  # 60 minutes
-TIME_PENALTY_SECONDS = 60       # 1 minute per bid
+INITIAL_TIME_SECONDS = 60 * 60       # 60 minutes
+TIME_PENALTY_NORMAL = 60             # 1 minute per bid (normal phase)
+TIME_PENALTY_FINAL = 10              # 10 seconds per bid (final phase)
+FINAL_PHASE_THRESHOLD = 10 * 60      # Last 10 minutes = final phase
 PRIZE_PERCENT = 0.50
 DATA_FILE = "data.json"
+
+# Leadership & inactivity limits
+MAX_LEADER_TIME = 3 * 60             # 3 minutes max as leader
+INACTIVITY_WARNING = 2 * 60          # 2 min without bids = warning
+INACTIVITY_TIMEOUT = 3 * 60          # 3 min without bids = auto-win
 
 PAYMENT_INFO = """💰 DATOS DE PAGO 💰
 
@@ -88,7 +95,7 @@ data = load_data()
 pozo_task = None
 pozo_lock = asyncio.Lock()
 cooldowns = {}  # {user_id: last_bid_timestamp}
-COOLDOWN_SECONDS = 60  # 1 minute
+COOLDOWN_SECONDS = 60  # 1 minute (disabled in final phase)
 
 
 # ─── Board rendering ─────────────────────────────────────────────────────────
@@ -104,6 +111,8 @@ def render_board(pozo):
     fund = pozo["fund"]
     prize = fund * PRIZE_PERCENT
     bids = pozo.get("bid_count", 0)
+    is_final = remaining <= FINAL_PHASE_THRESHOLD and remaining > 0
+    is_paused = pozo.get("paused", False)
 
     anim = "⏳" if int(time.time()) % 2 == 0 else "⌛"
 
@@ -119,6 +128,12 @@ def render_board(pozo):
             f"{'='*28}"
         )
 
+    phase_text = ""
+    if is_paused:
+        phase_text = "\n⏸️ RELOJ EN PAUSA - Esperando nuevo líder"
+    elif is_final:
+        phase_text = "\n🔥 FASE FINAL - Sin cooldown, -10s por puja"
+
     return (
         f"{'='*28}\n"
         f"    🏆 POZO ACTIVO 🏆\n"
@@ -127,7 +142,8 @@ def render_board(pozo):
         f"👑 Titular: {titular_display}\n\n"
         f"💰 Fondo: ${fund:.2f}\n"
         f"🎁 Premio (50%): ${prize:.2f}\n"
-        f"⚡ Pujas: {bids}\n\n"
+        f"⚡ Pujas: {bids}"
+        f"{phase_text}\n\n"
         f"{'='*28}"
     )
 
@@ -138,14 +154,12 @@ async def resend_board(bot, pozo, reply_markup=None, disable_notification=True):
     chat_id = pozo["chat_id"]
     old_msg_id = pozo.get("message_id")
 
-    # Delete old board message
     if old_msg_id:
         try:
             await bot.delete_message(chat_id=chat_id, message_id=old_msg_id)
         except (BadRequest, TelegramError):
             pass
 
-    # Send new board at bottom
     text = render_board(pozo)
     markup = reply_markup if reply_markup else BOARD_INLINE
     msg = await bot.send_message(
@@ -158,9 +172,65 @@ async def resend_board(bot, pozo, reply_markup=None, disable_notification=True):
     return msg
 
 
+# ─── Helper: finish pozo (winner announcement) ──────────────────────────────
+async def finish_pozo(bot, pozo, reason=""):
+    """Clean up and announce winner."""
+    global data
+
+    chat_id = pozo["chat_id"]
+
+    # Delete all pozo messages
+    for key in ("message_id", "notification_msg_id", "init_msg_id", "warning_msg_id"):
+        msg_id = pozo.get(key)
+        if msg_id:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except (BadRequest, TelegramError):
+                pass
+
+    titular_user = pozo.get("titular_username", "")
+    titular_name = pozo.get("titular_name", "Nadie")
+    titular_id = pozo.get("titular_id")
+    prize = pozo["fund"] * PRIZE_PERCENT
+    winner = f"@{titular_user}" if titular_user else titular_name
+
+    reason_text = f"\n{reason}" if reason else ""
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"🎉🎉🎉 POZO FINALIZADO 🎉🎉🎉\n\n"
+            f"👑 GANADOR: {winner}\n"
+            f"🎁 Premio: ${prize:.2f}\n\n"
+            f"¡Felicidades!{reason_text}"
+        ),
+        reply_markup=GROUP_KEYBOARD
+    )
+
+    if titular_id:
+        try:
+            await bot.send_message(
+                chat_id=int(titular_id),
+                text=(
+                    f"🎉🎉🎉 ¡FELICIDADES! 🎉🎉🎉\n\n"
+                    f"¡Eres el GANADOR del pozo!\n"
+                    f"🎁 Tu premio: ${prize:.2f}\n\n"
+                    f"📋 Envía tus datos para recibir el pago:\n"
+                    f"- Nombre completo\n"
+                    f"- Número de teléfono / Binance ID\n"
+                    f"- Banco"
+                )
+            )
+        except TelegramError:
+            pass
+
+    data["pozo"] = None
+    save_data(data)
+
+
 # ─── Pozo update loop ────────────────────────────────────────────────────────
 async def pozo_update_loop(app: Application):
-    """Edit board in place every 5 seconds (no new messages)."""
+    """Edit board in place every 5 seconds. Handles leader timeout & inactivity."""
     global data
 
     while True:
@@ -172,59 +242,116 @@ async def pozo_update_loop(app: Application):
 
             pozo = data["pozo"]
             remaining = pozo["end_time"] - time.time()
+            now = time.time()
 
-            if remaining <= 0:
-                # Pozo ended - clean up all messages
-                chat_id = pozo["chat_id"]
-                for key in ("message_id", "notification_msg_id", "init_msg_id"):
-                    msg_id = pozo.get(key)
-                    if msg_id:
-                        try:
-                            await app.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                        except (BadRequest, TelegramError):
-                            pass
+            # ── Timer reached 0 ──
+            if remaining <= 0 and not pozo.get("paused", False):
+                await finish_pozo(app.bot, pozo)
+                break
 
-                # Announce winner in group
+            # ── Check leader time limit (3 min max) ──
+            leader_since = pozo.get("leader_since", 0)
+            if (pozo["titular_id"] is not None
+                    and leader_since > 0
+                    and not pozo.get("paused", False)
+                    and (now - leader_since) >= MAX_LEADER_TIME):
+
                 titular_user = pozo.get("titular_username", "")
                 titular_name = pozo.get("titular_name", "Nadie")
-                titular_id = pozo.get("titular_id")
-                prize = pozo["fund"] * PRIZE_PERCENT
-                winner = f"@{titular_user}" if titular_user else titular_name
+                old_leader = f"@{titular_user}" if titular_user else titular_name
 
-                await app.bot.send_message(
+                # Expel leader, pause timer
+                pozo["titular_id"] = None
+                pozo["titular_name"] = "Nadie"
+                pozo["titular_username"] = ""
+                pozo["paused"] = True
+                pozo["pause_remaining"] = remaining  # Save remaining time
+                pozo["leader_since"] = 0
+
+                data["pozo"] = pozo
+                save_data(data)
+
+                # Delete old notification
+                old_notif = pozo.get("notification_msg_id")
+                if old_notif:
+                    try:
+                        await app.bot.delete_message(chat_id=pozo["chat_id"], message_id=old_notif)
+                    except (BadRequest, TelegramError):
+                        pass
+
+                notif = await app.bot.send_message(
                     chat_id=pozo["chat_id"],
                     text=(
-                        f"🎉🎉🎉 POZO FINALIZADO 🎉🎉🎉\n\n"
-                        f"👑 GANADOR: {winner}\n"
-                        f"🎁 Premio: ${prize:.2f}\n\n"
-                        f"¡Felicidades!"
+                        f"⏸️ {old_leader} fue removido por alcanzar 3 minutos como líder.\n"
+                        f"El reloj está en PAUSA. ¡Alguien debe tomar la posición!"
                     ),
                     reply_markup=GROUP_KEYBOARD
                 )
+                pozo["notification_msg_id"] = notif.message_id
 
-                # Send private message to winner
-                if titular_id:
-                    try:
-                        await app.bot.send_message(
-                            chat_id=int(titular_id),
-                            text=(
-                                f"🎉🎉🎉 ¡FELICIDADES! 🎉🎉🎉\n\n"
-                                f"¡Eres el GANADOR del pozo!\n"
-                                f"🎁 Tu premio: ${prize:.2f}\n\n"
-                                f"📋 Envía tus datos para recibir el pago:\n"
-                                f"- Nombre completo\n"
-                                f"- Número de teléfono / Binance ID\n"
-                                f"- Banco"
-                            )
-                        )
-                    except TelegramError:
-                        pass
-
-                data["pozo"] = None
+                await resend_board(app.bot, pozo, BOARD_INLINE, disable_notification=True)
+                data["pozo"] = pozo
                 save_data(data)
-                break
+                continue
 
-            # Edit board in place (no new message, just updates the text)
+            # ── Check inactivity (abandonment) ──
+            last_bid_time = pozo.get("last_bid_time", pozo.get("created_at", now))
+            inactivity = now - last_bid_time
+
+            if pozo["titular_id"] is not None and not pozo.get("paused", False):
+                # 2 min without bids = send warning
+                if inactivity >= INACTIVITY_WARNING and not pozo.get("warning_sent", False):
+                    titular_user = pozo.get("titular_username", "")
+                    titular_name = pozo.get("titular_name", "Nadie")
+                    leader = f"@{titular_user}" if titular_user else titular_name
+
+                    # Delete old warning if exists
+                    old_warn = pozo.get("warning_msg_id")
+                    if old_warn:
+                        try:
+                            await app.bot.delete_message(chat_id=pozo["chat_id"], message_id=old_warn)
+                        except (BadRequest, TelegramError):
+                            pass
+
+                    warn_msg = await app.bot.send_message(
+                        chat_id=pozo["chat_id"],
+                        text=(
+                            f"⚠️ ¡ATENCIÓN! Si en 60 segundos nadie toma la posición, "
+                            f"el usuario {leader} ganará el pozo por abandono."
+                        ),
+                        reply_markup=GROUP_KEYBOARD
+                    )
+                    pozo["warning_msg_id"] = warn_msg.message_id
+                    pozo["warning_sent"] = True
+                    data["pozo"] = pozo
+                    save_data(data)
+
+                # 3 min without bids = auto-win by inactivity
+                if inactivity >= INACTIVITY_TIMEOUT:
+                    await finish_pozo(app.bot, pozo, reason="🏆 Victoria por abandono - nadie tomó la posición.")
+                    break
+
+            # ── If paused, don't count down but still update board ──
+            if pozo.get("paused", False):
+                # Keep end_time moving so it doesn't expire while paused
+                if "pause_remaining" in pozo:
+                    pozo["end_time"] = now + pozo["pause_remaining"]
+
+            # ── In final phase, timer does NOT count down automatically ──
+            # (timer only decreases by bids in final phase)
+            # We achieve this by freezing end_time when in final phase with no bids
+            if not pozo.get("paused", False) and remaining <= FINAL_PHASE_THRESHOLD:
+                if not pozo.get("final_phase_active", False):
+                    pozo["final_phase_active"] = True
+                    pozo["frozen_remaining"] = remaining
+                    data["pozo"] = pozo
+                    save_data(data)
+
+                # Keep time frozen (no auto-countdown)
+                if "frozen_remaining" in pozo:
+                    pozo["end_time"] = now + pozo["frozen_remaining"]
+
+            # ── Update board ──
             text = render_board(pozo)
             try:
                 await app.bot.edit_message_text(
@@ -258,7 +385,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=PRIVATE_KEYBOARD
         )
     else:
-        # In group: send keyboard so THIS user sees the persistent buttons
         await update.message.reply_text(
             "💎 SISTEMA ON\n\nUsa el botón de abajo para participar.",
             reply_markup=GROUP_KEYBOARD
@@ -289,9 +415,9 @@ async def cmd_nuevopozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.CancelledError:
             pass
 
-    # Create new pozo
+    now = time.time()
     pozo = {
-        "end_time": time.time() + INITIAL_TIME_SECONDS,
+        "end_time": now + INITIAL_TIME_SECONDS,
         "titular_id": None,
         "titular_name": "Nadie",
         "titular_username": "",
@@ -299,18 +425,26 @@ async def cmd_nuevopozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "bid_count": 0,
         "chat_id": update.effective_chat.id,
         "message_id": None,
-        "notification_msg_id": None,  # Track last notification to delete it
-        "init_msg_id": None,          # Track init message to delete on close
+        "notification_msg_id": None,
+        "init_msg_id": None,
+        "warning_msg_id": None,
+        "leader_since": 0,
+        "last_bid_time": now,
+        "created_at": now,
+        "paused": False,
+        "warning_sent": False,
+        "final_phase_active": False,
     }
 
-    # Send init message with persistent keyboard (so all users see buttons)
+    # Reset cooldowns
+    cooldowns.clear()
+
     init_msg = await update.effective_chat.send_message(
         text="⏳ INICIANDO RELOJ...",
         reply_markup=GROUP_KEYBOARD
     )
     pozo["init_msg_id"] = init_msg.message_id
 
-    # Send the board WITH inline buttons on the message itself
     text = render_board(pozo)
     msg = await update.effective_chat.send_message(
         text=text,
@@ -321,7 +455,6 @@ async def cmd_nuevopozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data["pozo"] = pozo
     save_data(data)
 
-    # Start update loop
     pozo_task = asyncio.create_task(pozo_update_loop(context.application))
 
     try:
@@ -381,7 +514,6 @@ async def cmd_cerrarpozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     pozo = data["pozo"]
 
-    # Cancel update loop
     if pozo_task and not pozo_task.done():
         pozo_task.cancel()
         try:
@@ -389,9 +521,9 @@ async def cmd_cerrarpozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.CancelledError:
             pass
 
-    # Delete all pozo messages (board, notification, init)
+    # Delete all pozo messages
     chat_id = pozo["chat_id"]
-    for key in ("message_id", "notification_msg_id", "init_msg_id"):
+    for key in ("message_id", "notification_msg_id", "init_msg_id", "warning_msg_id"):
         msg_id = pozo.get(key)
         if msg_id:
             try:
@@ -399,7 +531,6 @@ async def cmd_cerrarpozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except (BadRequest, TelegramError):
                 pass
 
-    # Announce closure
     titular_user = pozo.get("titular_username", "")
     titular_name = pozo.get("titular_name", "Nadie")
     titular_id = pozo.get("titular_id")
@@ -418,7 +549,6 @@ async def cmd_cerrarpozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ),
             reply_markup=GROUP_KEYBOARD
         )
-        # Notify winner privately
         try:
             await context.bot.send_message(
                 chat_id=int(titular_id),
@@ -459,19 +589,29 @@ async def do_bid(user, chat_id, context, is_callback=False, query=None):
         return False, "❌ No hay pozo activo."
 
     pozo = data["pozo"]
-    remaining = pozo["end_time"] - time.time()
-    if remaining <= 0:
-        return False, "❌ El pozo ya finalizó."
+    now = time.time()
+
+    # Check if timer expired (and not paused)
+    if not pozo.get("paused", False):
+        remaining = pozo["end_time"] - now
+        if remaining <= 0:
+            return False, "❌ El pozo ya finalizó."
+    else:
+        remaining = pozo.get("pause_remaining", 0)
 
     user_id = str(user.id)
     username = f"@{user.username}" if user.username else user.full_name
 
-    # Cooldown check
-    last_bid = cooldowns.get(user_id, 0)
-    elapsed = time.time() - last_bid
-    if elapsed < COOLDOWN_SECONDS:
-        remaining_cd = int(COOLDOWN_SECONDS - elapsed) + 1
-        return False, f"⚠️ {username}, debes esperar {remaining_cd} segundos para volver a tomar la posición."
+    # Determine if we're in final phase
+    is_final = remaining <= FINAL_PHASE_THRESHOLD
+
+    # Cooldown check (DISABLED in final phase)
+    if not is_final:
+        last_bid = cooldowns.get(user_id, 0)
+        elapsed = now - last_bid
+        if elapsed < COOLDOWN_SECONDS:
+            remaining_cd = int(COOLDOWN_SECONDS - elapsed) + 1
+            return False, f"⚠️ {username}, debes esperar {remaining_cd} segundos para volver a tomar la posición."
 
     if pozo["titular_id"] == user_id:
         return False, "⚠️ Ya eres el titular actual."
@@ -493,32 +633,57 @@ async def do_bid(user, chat_id, context, is_callback=False, query=None):
         pozo["titular_username"] = user.username or ""
         pozo["fund"] += BID_COST
         pozo["bid_count"] += 1
-        pozo["end_time"] -= TIME_PENALTY_SECONDS
+        pozo["leader_since"] = now
+        pozo["last_bid_time"] = now
+        pozo["warning_sent"] = False  # Reset warning on new bid
+
+        # Time penalty depends on phase
+        if is_final:
+            penalty = TIME_PENALTY_FINAL  # 10 seconds
+        else:
+            penalty = TIME_PENALTY_NORMAL  # 1 minute
+
+        # If paused, unpause with saved remaining time minus penalty
+        if pozo.get("paused", False):
+            pozo["paused"] = False
+            new_remaining = pozo.get("pause_remaining", remaining) - penalty
+            pozo["end_time"] = now + max(0, new_remaining)
+            if "pause_remaining" in pozo:
+                del pozo["pause_remaining"]
+        else:
+            pozo["end_time"] -= penalty
+
+        # Update frozen_remaining in final phase
+        if pozo.get("final_phase_active", False):
+            new_remaining = pozo["end_time"] - now
+            pozo["frozen_remaining"] = max(0, new_remaining)
 
         data["pozo"] = pozo
         save_data(data)
 
     # Set cooldown for this user
-    cooldowns[user_id] = time.time()
+    cooldowns[user_id] = now
 
-    # Delete previous notification to keep chat clean
-    old_notif = pozo.get("notification_msg_id")
-    if old_notif:
-        try:
-            await context.bot.delete_message(chat_id=pozo["chat_id"], message_id=old_notif)
-        except (BadRequest, TelegramError):
-            pass
+    # Delete previous notification and warning
+    for key in ("notification_msg_id", "warning_msg_id"):
+        old_msg = pozo.get(key)
+        if old_msg:
+            try:
+                await context.bot.delete_message(chat_id=pozo["chat_id"], message_id=old_msg)
+            except (BadRequest, TelegramError):
+                pass
+            pozo[key] = None
 
-    # Send notification to group (with sound for push notification)
-    username = f"@{user.username}" if user.username else user.full_name
+    # Send notification to group
+    penalty_text = "10 segundos" if is_final else "1 minuto"
     notif_msg = await context.bot.send_message(
         chat_id=pozo["chat_id"],
-        text=f"⚡ ¡NUEVO LÍDER! {username} tomó el mando y restó 1 minuto. ⏱️",
+        text=f"⚡ ¡NUEVO LÍDER! {username} tomó el mando y restó {penalty_text}. ⏱️",
         reply_markup=GROUP_KEYBOARD
     )
     pozo["notification_msg_id"] = notif_msg.message_id
 
-    # Resend board at bottom (silent) so it's visible after the notification
+    # Resend board at bottom
     await resend_board(context.bot, pozo, BOARD_INLINE, disable_notification=True)
     data["pozo"] = pozo
     save_data(data)
@@ -532,7 +697,6 @@ async def handle_tomar_posicion(update: Update, context: ContextTypes.DEFAULT_TY
     user = update.effective_user
     chat = update.effective_chat
 
-    # Delete the button text message
     try:
         await update.message.delete()
     except TelegramError:
@@ -553,10 +717,8 @@ async def handle_gestionar_activo(update: Update, context: ContextTypes.DEFAULT_
     chat = update.effective_chat
 
     if chat.type == "private":
-        # In private: reply directly
         await update.message.reply_text(PAYMENT_INFO)
     else:
-        # In group: delete message and send to private
         try:
             await update.message.delete()
         except TelegramError:
@@ -584,10 +746,8 @@ async def handle_mi_saldo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance = data["balances"].get(user_id, {}).get("balance", 0)
 
     if chat.type == "private":
-        # In private: reply directly
         await update.message.reply_text(f"💳 Tu saldo: ${balance:.2f}")
     else:
-        # In group: delete message and send to private
         try:
             await update.message.delete()
         except TelegramError:
@@ -683,7 +843,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except TelegramError as e:
         logger.error(f"Could not forward payment to owner: {e}")
 
-    # Delete from group
     if chat.type in ("group", "supergroup"):
         try:
             await update.message.delete()
@@ -775,7 +934,7 @@ async def post_init(app: Application):
     global pozo_task
     if data["pozo"] is not None:
         remaining = data["pozo"]["end_time"] - time.time()
-        if remaining > 0:
+        if remaining > 0 or data["pozo"].get("paused", False):
             logger.info("Resuming active pozo...")
             pozo_task = asyncio.create_task(pozo_update_loop(app))
         else:
