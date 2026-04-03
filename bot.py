@@ -88,7 +88,7 @@ data = load_data()
 pozo_task = None
 pozo_lock = asyncio.Lock()
 cooldowns = {}  # {user_id: last_bid_timestamp}
-COOLDOWN_SECONDS = 5
+COOLDOWN_SECONDS = 60  # 1 minute
 
 
 # ─── Board rendering ─────────────────────────────────────────────────────────
