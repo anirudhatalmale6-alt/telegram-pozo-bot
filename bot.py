@@ -172,21 +172,15 @@ async def pozo_update_loop(app: Application):
             remaining = pozo["end_time"] - time.time()
 
             if remaining <= 0:
-                # Pozo ended - delete board and send final result
-                old_msg_id = pozo.get("message_id")
-                if old_msg_id:
-                    try:
-                        await app.bot.delete_message(
-                            chat_id=pozo["chat_id"], message_id=old_msg_id
-                        )
-                    except (BadRequest, TelegramError):
-                        pass
-
-                text = render_board(pozo)
-                await app.bot.send_message(
-                    chat_id=pozo["chat_id"],
-                    text=text
-                )
+                # Pozo ended - clean up all messages
+                chat_id = pozo["chat_id"]
+                for key in ("message_id", "notification_msg_id", "init_msg_id"):
+                    msg_id = pozo.get(key)
+                    if msg_id:
+                        try:
+                            await app.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                        except (BadRequest, TelegramError):
+                            pass
 
                 # Announce winner in group
                 titular_user = pozo.get("titular_username", "")
@@ -303,13 +297,16 @@ async def cmd_nuevopozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "bid_count": 0,
         "chat_id": update.effective_chat.id,
         "message_id": None,
+        "notification_msg_id": None,  # Track last notification to delete it
+        "init_msg_id": None,          # Track init message to delete on close
     }
 
     # Send init message with persistent keyboard (so all users see buttons)
-    await update.effective_chat.send_message(
+    init_msg = await update.effective_chat.send_message(
         text="⏳ INICIANDO RELOJ...",
         reply_markup=GROUP_KEYBOARD
     )
+    pozo["init_msg_id"] = init_msg.message_id
 
     # Send the board WITH inline buttons on the message itself
     text = render_board(pozo)
@@ -390,15 +387,15 @@ async def cmd_cerrarpozo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except asyncio.CancelledError:
             pass
 
-    # Delete board message
-    old_msg_id = pozo.get("message_id")
-    if old_msg_id:
-        try:
-            await context.bot.delete_message(
-                chat_id=pozo["chat_id"], message_id=old_msg_id
-            )
-        except (BadRequest, TelegramError):
-            pass
+    # Delete all pozo messages (board, notification, init)
+    chat_id = pozo["chat_id"]
+    for key in ("message_id", "notification_msg_id", "init_msg_id"):
+        msg_id = pozo.get(key)
+        if msg_id:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+            except (BadRequest, TelegramError):
+                pass
 
     # Announce closure
     titular_user = pozo.get("titular_username", "")
@@ -491,13 +488,22 @@ async def do_bid(user, chat_id, context, is_callback=False, query=None):
         data["pozo"] = pozo
         save_data(data)
 
+    # Delete previous notification to keep chat clean
+    old_notif = pozo.get("notification_msg_id")
+    if old_notif:
+        try:
+            await context.bot.delete_message(chat_id=pozo["chat_id"], message_id=old_notif)
+        except (BadRequest, TelegramError):
+            pass
+
     # Send notification to group (with sound for push notification)
     username = f"@{user.username}" if user.username else user.full_name
-    await context.bot.send_message(
+    notif_msg = await context.bot.send_message(
         chat_id=pozo["chat_id"],
         text=f"⚡ ¡NUEVO LÍDER! {username} tomó el mando y restó 1 minuto. ⏱️",
         reply_markup=GROUP_KEYBOARD
     )
+    pozo["notification_msg_id"] = notif_msg.message_id
 
     # Resend board at bottom (silent) so it's visible after the notification
     await resend_board(context.bot, pozo, BOARD_INLINE, disable_notification=True)
